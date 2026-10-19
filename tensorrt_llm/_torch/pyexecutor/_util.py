@@ -209,9 +209,12 @@ def get_kv_cache_manager_cls(
                 "FP4 MLA disaggregated serving requires the follow-up "
                 "Python NIXL integration.")
         if is_hybrid_linear(config):
-            raise NotImplementedError(
-                "FP4 MLA requires Fp4MlaKVCacheManagerV2, which does not "
-                "support hybrid linear-attention models.")
+            if use_py_mamba_cache_manager() or os.environ.get(
+                    "TLLM_MAMBA_MANAGER_PREFERENCE"):
+                raise ValueError(
+                    "Hybrid FP4 MLA requires MambaHybridCacheManagerV2; unset "
+                    "TRTLLM_USE_PY_MAMBA / TLLM_MAMBA_MANAGER_PREFERENCE.")
+            return MambaHybridCacheManagerV2
         from ..attention.backends.fp4_mla.cache_manager import \
             Fp4MlaKVCacheManagerV2
 
@@ -3353,6 +3356,10 @@ def _create_kv_cache_manager(
         # states in place, replacing the intermediate-buffer + promotion
         # flow for KDA layers.
         kda_extra_kwargs = {}
+        if (quant_config is not None
+                and quant_config.quant_mode.has_fp4_kv_cache() and issubclass(
+                    kv_cache_manager_cls, MambaHybridCacheManagerV2)):
+            kda_extra_kwargs["pretrained_config"] = config
         kda_replay_manager_types = (MixedMambaHybridCacheManager,
                                     MambaHybridCacheManagerV2)
         if (spec_config is not None

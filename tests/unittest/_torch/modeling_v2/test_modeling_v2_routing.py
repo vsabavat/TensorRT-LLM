@@ -406,6 +406,18 @@ def test_kimi_k3_targets_match(mode, text_as_dict, mapping_kwargs, target):
     assert _qualified(modeling_v2_resolve(config, _llm_args(mode))) == target
 
 
+@pytest.mark.parametrize("mode", ["auto", "require"])
+@pytest.mark.parametrize(
+    "mapping_kwargs,parallel",
+    [(_TP16_MOETP4EP4, "Moetp4ep4"), (_TP16_MOETP16EP1, "Moetp16ep1")],
+)
+def test_kimi_k3_mxfp4_routes_on_sm103(mode, mapping_kwargs, parallel):
+    config = _model_config(_k3_config(), **mapping_kwargs)
+    target = modeling_v2_resolve(config, _llm_args(mode))
+    assert target.__name__ == f"ModelingV2KimiK3Mxfp4Sm103Tp16{parallel}"
+    assert target.target_spec.sm == _SM103
+
+
 @pytest.mark.usefixtures("_on_sm100")
 @pytest.mark.parametrize(
     "quantization",
@@ -452,12 +464,235 @@ def test_kimi_k3_near_misses_do_not_match(text_overrides, mapping_kwargs, missed
         modeling_v2_resolve(config, _llm_args("require"))
 
 
-def test_kimi_k3_on_another_sm_does_not_match():
-    """The autouse fixture routes as a GB300 (sm 10.3); the K3 targets are sm 10.0 only."""
+def test_kimi_k3_on_another_sm_does_not_match(monkeypatch):
+    """The MXFP4 fused decode path is scoped to SM100/SM103."""
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **kw: (10, 7))
     config = _model_config(_k3_config(), **_TP16_MOETP4EP4)
     assert modeling_v2_resolve(config, _llm_args("auto")) is None
-    with pytest.raises(ValueError, match=r"compute capability \(10, 3\)"):
+    with pytest.raises(ValueError, match=r"compute capability \(10, 7\)"):
         modeling_v2_resolve(config, _llm_args("require"))
+
+
+def _k3_nvfp4_mixed_config():
+    """ModelOpt's expert declarations, alongside FP8 attention projections."""
+    return {
+        "quant_method": "modelopt",
+        "quantization": {
+            "quant_algo": "MIXED_PRECISION",
+            "group_size": 16,
+            "quantized_layers": {
+                **{
+                    f"language_model.model.layers.{layer}.mlp.experts": {
+                        "quant_algo": "NVFP4",
+                        "group_size": 16,
+                    }
+                    for layer in range(1, 93)
+                },
+                "language_model.model.layers.1.self_attn.q_proj": {"quant_algo": "FP8_PB_WO"},
+            },
+        },
+    }
+
+
+@pytest.mark.parametrize("mode", ["auto", "require"])
+@pytest.mark.parametrize("quant_method", ["modelopt", "modelopt_mixed"])
+@pytest.mark.parametrize("sm", [103, 107])
+def test_kimi_k3_nvfp4_routes(monkeypatch, mode, quant_method, sm):
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **kw: (sm // 10, sm % 10))
+    quantization = _k3_nvfp4_mixed_config()
+    if quant_method == "modelopt_mixed":
+        quantization = dict(quantization["quantization"], quant_method=quant_method)
+    config = _model_config(_k3_config(quantization=quantization), **_TP16_MOETP4EP4)
+    assert _qualified(modeling_v2_resolve(config, _llm_args(mode))) == (
+        f"models.kimi_k3_vl.kimi_k3_nvfp4__sm_{sm}__tp16_moetp4ep4.modeling."
+        f"ModelingV2KimiK3Nvfp4Sm{sm}Tp16Moetp4ep4"
+    )
+
+
+@pytest.mark.parametrize("bad_layer", ["missing", "mxfp4", "wrong_group_size"])
+@pytest.mark.parametrize("sm", [103, 107])
+def test_kimi_k3_nvfp4_rejects_incomplete_expert_declarations(monkeypatch, bad_layer, sm):
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **kw: (sm // 10, sm % 10))
+    quantization = _k3_nvfp4_mixed_config()
+    layers = quantization["quantization"]["quantized_layers"]
+    key = "language_model.model.layers.92.mlp.experts"
+    if bad_layer == "missing":
+        del layers[key]
+    elif bad_layer == "mxfp4":
+        layers[key] = {"quant_algo": "W4A8_MXFP4_MXFP8", "group_size": 32}
+    else:
+        layers[key]["group_size"] = 32
+    config = _model_config(_k3_config(quantization=quantization), **_TP16_MOETP4EP4)
+    with pytest.raises(ValueError):
+        modeling_v2_resolve(config, _llm_args("require"))
+
+
+def test_kimi_k3_nvfp4_rejects_uniformly_quantized_attention(monkeypatch):
+    """NVFP4 attention weights are distinct from the supported FP8 attention checkpoint."""
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **kw: (10, 7))
+    config = _model_config(_k3_config(quantization=_K3_NVFP4_QUANTIZATION), **_TP16_MOETP4EP4)
+    with pytest.raises(ValueError, match="no target fits"):
+        modeling_v2_resolve(config, _llm_args("require"))
+
+
+def test_kimi_k3_nvfp4_declines_excluded_experts(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **kw: (10, 7))
+    quantization = _k3_nvfp4_mixed_config()
+    quantization["quantization"]["exclude_modules"] = ["*.layers.92.mlp.experts"]
+    config = _model_config(_k3_config(quantization=quantization), **_TP16_MOETP4EP4)
+    assert modeling_v2_resolve(config, _llm_args("auto")) is None
+    with pytest.raises(ValueError, match="no target fits"):
+        modeling_v2_resolve(config, _llm_args("require"))
+
+
+def test_kimi_k3_nvfp4_constructor_uses_per_layer_quantization():
+    from types import SimpleNamespace
+
+    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_nvfp4.implementation import (
+        KimiK3MoERuntime,
+    )
+
+    moe_runtime = KimiK3MoERuntime
+
+    quant, layers = ModelConfig.load_hf_quant_config(_k3_nvfp4_mixed_config(), "TRTLLM")
+    config = SimpleNamespace(quant_config=quant, quant_config_dict=layers)
+    for layer_idx in (1, 92):
+        resolved = moe_runtime._resolve_routed_quant_config(config, layer_idx)
+        assert resolved.quant_algo == QuantAlgo.NVFP4
+        assert resolved.group_size == 16
+    del layers["language_model.model.layers.92.mlp.experts"]
+    with pytest.raises(ValueError, match="Missing NVFP4"):
+        moe_runtime._resolve_routed_quant_config(config, 92)
+
+
+@pytest.mark.parametrize("prefix", ["language_model.model.", "model.", ""])
+def test_kimi_k3_nvfp4_experts_honor_excluded_aliases(prefix: str) -> None:
+    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_nvfp4.implementation import (
+        KimiK3MoERuntime,
+    )
+    from tensorrt_llm.models.modeling_utils import QuantConfig
+
+    name = f"{prefix}layers.92.mlp.experts"
+    config = ModelConfig(
+        quant_config=QuantConfig(quant_algo=QuantAlgo.MIXED_PRECISION, exclude_modules=[name]),
+        quant_config_dict={name: QuantConfig(quant_algo=QuantAlgo.NVFP4, group_size=16)},
+    )
+    with pytest.raises(ValueError, match="excluded from quantization"):
+        KimiK3MoERuntime._resolve_routed_quant_config(config, 92)
+
+
+def test_kimi_k3_nvfp4_keeps_mla_dspark_worker():
+    """The reference MLA drafter must retain its compressed-context-cache worker."""
+    import importlib
+    from types import SimpleNamespace
+
+    target = importlib.import_module(
+        "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl."
+        "kimi_k3_nvfp4__sm_107__tp16_moetp4ep4.modeling"
+    )
+    drafter, worker = object(), object()
+    model = SimpleNamespace(
+        draft_config=SimpleNamespace(
+            pretrained_config=PretrainedConfig(kv_lora_rank=512, qk_rope_head_dim=64)
+        ),
+        draft_model=drafter,
+        spec_worker=worker,
+        epilogue=[drafter, worker],
+    )
+    config = SimpleNamespace(
+        spec_config=SimpleNamespace(
+            spec_dec_mode=SimpleNamespace(is_dspark=lambda: True),
+            draft_is_embedded_in_target=False,
+        )
+    )
+    target.ModelingV2KimiK3Nvfp4Sm107Tp16Moetp4ep4._own_spec_branch(model, config)
+    assert model.draft_model is drafter
+    assert model.spec_worker is worker
+    assert model.epilogue == [drafter, worker]
+
+
+@pytest.mark.parametrize("prefix", ["language_model.model.", "model.", ""])
+def test_kimi_k3_nvfp4_attention_quantization_preserves_config(prefix: str) -> None:
+    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_nvfp4 import (
+        implementation as target,
+    )
+    from tensorrt_llm.models.modeling_utils import QuantConfig
+
+    projection = QuantConfig(quant_algo=QuantAlgo.FP8_BLOCK_SCALES, group_size=128)
+    global_quant = QuantConfig(
+        quant_algo=QuantAlgo.MIXED_PRECISION, kv_cache_quant_algo=QuantAlgo.NVFP4
+    )
+    config = ModelConfig(
+        quant_config=global_quant,
+        quant_config_dict={f"{prefix}layers.3.self_attn.q_a_proj": projection},
+    )
+    resolved = target.resolve_attention_quant_config(config, 3, "q_a_proj")
+    assert resolved.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
+    assert resolved.group_size == 128
+    assert resolved.kv_cache_quant_algo == QuantAlgo.NVFP4
+    assert projection.kv_cache_quant_algo is None
+    assert target.resolve_attention_quant_config(config, 3, "g_proj").quant_algo is None
+
+
+def test_kimi_k3_nvfp4_attention_honors_exclusions() -> None:
+    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_nvfp4 import (
+        implementation as target,
+    )
+    from tensorrt_llm.models.modeling_utils import QuantConfig
+
+    config = ModelConfig(
+        quant_config=QuantConfig(
+            quant_algo=QuantAlgo.MIXED_PRECISION,
+            kv_cache_quant_algo=QuantAlgo.NVFP4,
+            exclude_modules=["*.g_proj"],
+        ),
+        quant_config_dict={
+            "model.layers.3.self_attn.g_proj": QuantConfig(quant_algo=QuantAlgo.FP8_BLOCK_SCALES)
+        },
+    )
+    resolved = target.resolve_attention_quant_config(config, 3, "g_proj")
+    assert resolved.quant_algo is None
+    assert resolved.kv_cache_quant_algo == QuantAlgo.NVFP4
+
+
+@pytest.mark.parametrize(
+    "algo,group_size", [(QuantAlgo.NVFP4, 16), (QuantAlgo.FP8_BLOCK_SCALES, 64)]
+)
+def test_kimi_k3_nvfp4_attention_rejects_unsupported_quantization(
+    algo: QuantAlgo, group_size: int
+) -> None:
+    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_nvfp4 import (
+        implementation as target,
+    )
+    from tensorrt_llm.models.modeling_utils import QuantConfig
+
+    config = ModelConfig(
+        quant_config=QuantConfig(quant_algo=QuantAlgo.MIXED_PRECISION),
+        quant_config_dict={
+            "model.layers.3.self_attn.q_a_proj": QuantConfig(quant_algo=algo, group_size=group_size)
+        },
+    )
+    with pytest.raises(ValueError, match="quantization|128x128"):
+        target.resolve_attention_quant_config(config, 3, "q_a_proj")
+
+
+def test_kimi_k3_nvfp4_attention_rejects_conflicting_block_sizes() -> None:
+    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_nvfp4 import (
+        implementation as target,
+    )
+    from tensorrt_llm.models.modeling_utils import QuantConfig
+
+    config = ModelConfig(
+        quant_config=QuantConfig(quant_algo=QuantAlgo.MIXED_PRECISION),
+        quant_config_dict={
+            f"{prefix}layers.3.self_attn.q_a_proj": QuantConfig(
+                quant_algo=QuantAlgo.FP8_BLOCK_SCALES, group_size=group_size
+            )
+            for prefix, group_size in (("language_model.model.", 128), ("model.", 64))
+        },
+    )
+    with pytest.raises(ValueError, match="Conflicting"):
+        target.resolve_attention_quant_config(config, 3, "q_a_proj")
 
 
 # --- qwen4_exp: one-model MTP-Eagle over a linear chain, one rank ---------------

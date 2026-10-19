@@ -7,8 +7,8 @@ float64 plain decode; a float64 verify that keeps each request's committed histo
 Not a test file (no ``test_`` prefix): the four entry tests import it by name, as ``comm/`` imports ``_rank_job``.
 
 Shapes: 6 heads, K = V = 128, conv width 4 (the TP16 rank slice); conv states bf16 in the ``[q | k | v]`` layout,
-SSM states fp32. The manager coalesces each slot's per-layer states, so every per-layer view is a strided slot view,
-the layout the model hands these ops.
+SSM states fp32 by default or bf16 when requested. The manager coalesces each slot's per-layer states, so every
+per-layer view is a strided slot view, the layout the model hands these ops.
 """
 
 from __future__ import annotations
@@ -48,7 +48,12 @@ def load_ops():
 # ---------------------------------------------------------------------------------------------------------------
 # The cache objects
 # ---------------------------------------------------------------------------------------------------------------
-def build_manager(num_layers: int, num_spec: int | None = None, max_batch_size: int = 8):
+def build_manager(
+    num_layers: int,
+    num_spec: int | None = None,
+    max_batch_size: int = 8,
+    state_dtype: torch.dtype = torch.float32,
+):
     """A real MambaHybridCacheManagerV2 with ``num_layers`` KDA layers (and one attention layer). With ``num_spec``:
     MTP-style speculation of ``num_spec`` drafts, the KDA replay caches and the drafts' records
     (``kda_draft_records``) that k3_kda_verify / k3_kda_attn read and write."""
@@ -69,7 +74,7 @@ def build_manager(num_layers: int, num_spec: int | None = None, max_batch_size: 
         mamba_num_layers=num_layers,
         mamba_layer_mask=[True] * num_layers + [False],
         mamba_cache_dtype=torch.bfloat16,
-        mamba_ssm_cache_dtype=torch.float32,
+        mamba_ssm_cache_dtype=state_dtype,
         kv_cache_config=KvCacheConfig(max_tokens=512, enable_block_reuse=False),
         kv_cache_type=CacheTypeCpp.SELF,
         num_layers=1,
@@ -100,8 +105,8 @@ def request_slots(mgr, count: int, first_id: int) -> torch.Tensor:
 
 def layer_pools(mgr, layer: int) -> dict:
     """The manager's views of one KDA layer's pools: ``conv`` bf16 [slots, 3 HK, W - 1] (q | k | v channels) and
-    ``ssm`` fp32 [slots, H, V, K] (plain decode); with the replay caches also ``cs_q`` / ``cs_k`` / ``cs_v`` fp32
-    [slots, HK, W - 1 + num_spec] (dim-contiguous), ``state_tok`` fp32 [slots, 3, num_spec, H, K] and ``pending``,
+    ``ssm`` fp32 or bf16 [slots, H, V, K] (plain decode); with the replay caches also ``cs_q`` / ``cs_k`` / ``cs_v``
+    fp32 [slots, HK, W - 1 + num_spec] (dim-contiguous), ``state_tok`` fp32 [slots, 3, num_spec, H, K] and ``pending``,
     the accepted-draft record every layer shares (``prev_num_accepted_tokens``)."""
     pools = {"conv": mgr.get_conv_states(layer), "ssm": mgr.get_ssm_states(layer)}
     if mgr.use_kda_replay_update:

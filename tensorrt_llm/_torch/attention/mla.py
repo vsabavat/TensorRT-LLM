@@ -730,13 +730,13 @@ class MLA(nn.Module):
             and self.quant_config.layer_quant_mode.has_fp4_kv_cache()
         ):
             if (
-                mla_weight_dtype != torch.bfloat16
+                mla_weight_dtype not in (torch.bfloat16, torch.float8_e4m3fn)
                 or self.mapping.cp_size != 1
                 or self.apply_rotary_emb
                 or self.kv_cache_dtype == "fp8_ds_mla"
             ):
                 raise ValueError(
-                    "FP4 MLA requires BF16 absorption weights and fused RoPE "
+                    "FP4 MLA requires BF16 or block-scaled FP8 absorption weights and fused RoPE "
                     "on the TRTLLM backend without context parallelism or "
                     "fp8_ds_mla cache packing."
                 )

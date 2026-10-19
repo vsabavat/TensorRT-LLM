@@ -1,7 +1,6 @@
 # ModelingV2
 
-One self-contained modeling codebase per deployment target, beside the
-built-in model zoo rather than inside it.
+Explicit deployment targets beside the built-in model zoo.
 
 Where `_torch/models/modeling_deepseekv3.py` is one class serving V3, V3-Lite,
 R1 and V3.2 across every GPU generation and parallel topology,
@@ -10,6 +9,43 @@ GPU architecture, parallel topology) triple — assembled only from `catalog/`
 entries, sharing nothing with its siblings, and trusted through accuracy gates
 instead of shared abstractions. The one-to-one correspondence between
 `models/<x>/` here and `modeling_<x>.py` there is the point of the exercise.
+
+Kimi K3 keeps its original MXFP4/SM100 deployments independent. The NVFP4
+implementation is a separate copy under `models/kimi_k3_vl/kimi_k3_nvfp4/`,
+shared by thin SM103 and SM107 target classes. NVFP4 retains checkpoint FP8
+projection weights and activations: decode fuses KDA's gate, convolution,
+recurrence and output normalization, and MLA's query/absorption/cache writes
+and attention/V-B/output gate. The ordinary FP8 GEMMs remain responsible for
+input and output projections. MLA's fused decode uses a BF16 KV cache with
+64-token pages, or composes the fused FP8 projections with the native FP8
+and NVFP4 cache/attention kernels. NVFP4 KV requires 128-token pages and the
+V2 cache manager; its high-precision tail and packed scales retain the native
+layout. The KDA fused decode and verify accept FP32 or BF16 recurrent-state
+storage, with FP32 recurrence arithmetic and FP32 per-token draft records.
+These KV and SSM storage choices are independent of the NVFP4 expert weights.
+The fused Q-B projection follows the selected GEMM backend's FP8 recipe,
+including weight resmoothing and UE8M0 activation scales where required.
+
+| MLA KV storage | KDA SSM storage | KDA recurrence / draft records |
+|---|---|---|
+| BF16 | FP32 or BF16 | FP32 |
+| FP8 E4M3 | FP32 or BF16 | FP32 |
+| NVFP4 | FP32 or BF16 | FP32 |
+
+For NVFP4 KV and BF16 recurrent-state storage:
+
+```yaml
+modeling_v2: require
+enable_chunked_prefill: false
+kv_cache_config:
+  dtype: nvfp4
+  tokens_per_block: 128
+  mamba_ssm_cache_dtype: bfloat16
+  use_kv_cache_manager_v2: true
+```
+
+The NVFP4 expert kernels remain separate from the MXFP4/MXFP8 kernels.
+Every hardware and quantization target requires its own accuracy gates.
 
 ## Using it
 
